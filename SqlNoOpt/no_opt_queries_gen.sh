@@ -6,6 +6,7 @@ OFF_SQL="optimizer_switch_off.sql"
 DEFAULT_SQL="optimizer_switch_default.sql"
 
 mkdir -p "$OUTPUT_DIR"
+cp ../benchmark/queries . -r
 
 for file in "$INPUT_DIR"/*.sql; do
     filename=$(basename "$file")
