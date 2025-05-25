@@ -39,15 +39,29 @@ class GeminiClient:
         self.model="gemini-2.0-flash"
 
     def generate_query(self, sql_query: str):
+
+        contents = [
+        {
+            "role": "user",
+            "parts": [
+                f"Rewrite this SQL query to be more efficient and readable. "
+                f"Keep the logic identical.\n\n{sql_query}\n\nReturn only the rewritten SQL."
+            ]
+        }
+        ]
         return self.client.models.generate_content(
             model="gemini-2.0-flash",
             config=types.GenerateContentConfig(
-                system_instruction="You are a SQL rewriter expert. Rewrite the SQL query to be more efficient and readable.\
-                    please only return the SQL query without any additional text.",
+                system_instruction = (
+    "You are a world-class database query optimizer. "
+    "Your job is to rewrite SQL queries to make them more efficient and readable, "
+    "without changing their meaning or logic. Do not explain. "
+    "Return ONLY the improved SQL query with no extra text or formatting."
+            ),
                 temperature=0.2,
                 # max_output_tokens=1000,
                 ),
-            contents=sql_query,
+            contents=contents,
         )
 
 if __name__ == '__main__':
