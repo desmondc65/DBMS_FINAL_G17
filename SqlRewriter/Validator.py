@@ -1,46 +1,38 @@
+import os
 import re 
 import random 
+import logging
 import json 
+from typing import Optional, Dict, List, Set, Tuple
 import mysql.connector 
+import sqlparse 
+import sqlglot
+from sqlglot import parse_one, exp
+from itertools import product
+from sqlglot.expressions import Table
+from z3 import *
 
 # ========== Get Connector ========== #
-def get_connection(config_file: str='config.json') -> mysql.connector.connection.MySQLConnection:
+def get_connection(
+    config_file: str = './config.json',
+    # sql_dump_file: str = './tpcds_data_dump.sql'
+) -> mysql.connector.connection.MySQLConnection:
     """
-    Establishes a connection to the MySQL database.
+    Connects to MySQL, recreates the 'tpcsds' database, loads data from the given SQL dump file,
+    and returns a connection to the newly created database.
+
+    Args:
+        config_file (str): Path to JSON config file with host, user, passwd.
 
     Returns:
-        mysql.connector.connection.MySQLConnection: A connection object to the MySQL database.
+        mysql.connector.connection.MySQLConnection: Connection to the newly created 'tpcsds' database.
     """
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+
     with open(config_file) as f:
         config = json.load(f)
 
-    # Connect without specifying the database
-    conn = mysql.connector.connect(
-        host=config['host'],
-        user=config['user'],
-        passwd=config['passwd']
-    )
-    cursor = conn.cursor()
-
-    # Drop and recreate the database
-    cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")  # Disable foreign key checks
-    cursor.execute("DROP DATABASE IF EXISTS tpcsds;")
-    cursor.execute("CREATE DATABASE tpcsds;")
-    cursor.execute("USE tpcsds;")
-    print("Database 'tpcsds' recreated successfully.")
-
-    # # Check if the database exists, and create it if it doesn't
-    # cursor.execute("SHOW DATABASES;")
-    # databases = [db[0] for db in cursor.fetchall()]
-    # if "tpcsds" not in databases:
-    #     cursor.execute("CREATE DATABASE tpcsds;")
-    #     print("Database 'tpcsds' created successfully.")
-
-    # Close the temporary connection and reconnect with the database
-    cursor.close()
-    conn.close()
-
-    # Reconnect with the database specified
     return mysql.connector.connect(
         host=config['host'],
         user=config['user'],
@@ -48,306 +40,438 @@ def get_connection(config_file: str='config.json') -> mysql.connector.connection
         database="tpcsds"
     )
 
-
-# ========== Create Tables for Schema ========== #
-def create_tables(conn, schema_dict):
+# ========== Read and Clean SQL File ========== #
+def read_clean_sql(filepath: str) -> Optional[str]:
     """
-    Creates tables in the database based on the provided schema.
-
-    Args:
-        conn (mysql.connector.connection.MySQLConnection): The database connection.
-        schema_dict (dict): A dictionary mapping table names to their schemas.
-
-    Returns:
-        None
-    """
-    cursor = conn.cursor()
-    for table, schema in schema_dict.items():
-        # Filter out primary key entries and get regular columns
-        regular_columns = [
-            (col, dtype) for col, dtype in schema 
-            if dtype.upper() != "KEY"
-        ]
-
-        # Get primary key columns
-        primary_keys = [
-            col for col, dtype in schema 
-            if dtype.upper() == "KEY"
-        ]
-
-        # Create column definitions
-        column_defs = []
-        for col, dtype in regular_columns:
-            # Handle different data types
-            if dtype == "DECIMAL":
-                column_defs.append(f"{col} DECIMAL(10,2)")
-            elif dtype == "VARCHAR":
-                column_defs.append(f"{col} VARCHAR(255)")
-            else:
-                column_defs.append(f"{col} {dtype}")
-
-        # Add primary key constraint if exists
-        if primary_keys:
-            column_defs.append(f"PRIMARY KEY ({', '.join(primary_keys)})")
-
-        # Create the table
-        sql = f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(column_defs)});"
-        
-        try:
-            print(f"Executing SQL: {sql}")  # Debug print
-            cursor.execute(sql)
-            print(f"Table '{table}' created or already exists.")
-        except mysql.connector.Error as err:
-            print(f"Error creating table '{table}': {err}")
-            continue
-
-    conn.commit()
-    cursor.close()
-
-
-# ========== Execute Query ========== #
-def execute_query(cursor, query):
-    """
-    Executes a SQL query using the provided cursor.
-
-    Args:
-        cursor (mysql.connector.cursor.MySQLCursor): The cursor to execute the query.
-        query (str): The SQL query to execute.
-
-    Returns:
-        list: The result of the query as a list of tuples.
-    """
-    try:
-        cursor.execute(query)
-        results = cursor.fetchall()
-        cursor.close()  # Close cursor after fetching results
-        return sorted(results) if results else []
-    except mysql.connector.Error as err:
-        print(f"Error executing query: {err}")
-        print(f"Query: {query}")
-        return []
-
-# ========== Generate Data ========== #
-def generate_data(
-        cursor: mysql.connector.cursor.MySQLCursor, 
-        table: str, 
-        schema: list[tuple[str, str]], 
-        num_rows: int = 5) -> None:
-    """
-    Generates and inserts data into a specified table.
-
-    Args:
-        cursor (mysql.connector.cursor.MySQLCursor): The cursor to execute the SQL queries.
-        table (str): The name of the table to insert data into.
-        schema (list[tuple[str, str]]): A list of tuples where each tuple contains the column name and its data type.
-        num_rows (int, optional): The number of rows to generate. Defaults to 5.
-
-    Returns:
-        None
-    """
-    # Filter out KEY entries and get column names
-    columns = [col for col, dtype in schema if dtype.upper() != 'KEY']
-    regular_columns = [(col, dtype) for col, dtype in schema if dtype.upper() != 'KEY']
+    Reads a SQL file, removes comments, and returns a cleaned SQL string.
+    Preserves semicolons inside strings and avoids misinterpreting them as delimiters.
     
-    for i in range(num_rows):
-        values = []
-        for col, dtype in regular_columns:
-            if dtype == 'INT':
-                values.append(str(random.randint(1, 1000)))
-            elif dtype == 'DECIMAL':
-                values.append(str(round(random.uniform(1.0, 1000.0), 2)))
-            elif dtype == 'VARCHAR':
-                values.append(f"'value_{i}_{col}'")
-            elif dtype == 'DATE':
-                values.append(f"'2023-{random.randint(1,12):02d}-{random.randint(1,28):02d}'")
-            else:
-                values.append("NULL")
-        
-        sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(values)})"
-        try:
-            cursor.execute(sql)
-        except mysql.connector.Error as err:
-            print(f"Error inserting data into table '{table}': {err}")
-            print(f"SQL statement: {sql}")
-            continue
-
-def clear_table(
-        cursor: mysql.connector.cursor.MySQLCursor, 
-        table: str) -> None:
-    """
-    Clears all data from a specified table.
-
     Args:
-        cursor (mysql.connector.cursor.MySQLCursor): The cursor to execute the SQL queries.
-        table (str): The name of the table to clear.
+        filepath (str): Path to the .sql file
 
     Returns:
-        None
+        str: Cleaned SQL string, or None if no valid SQL found
     """
-    sql = f"DELETE FROM {table}"
-    cursor.execute(sql)
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"SQL file not found: {filepath}")
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        raw_sql = f.read()
+
+    # Strip comments safely and normalize whitespace
+    cleaned_sql = sqlparse.format(
+        raw_sql,
+        strip_comments=True,
+        strip_whitespace=True,
+        reindent=False
+    )
+
+    # Extract non-empty statement (assume first one is the main query)
+    statements = sqlparse.split(cleaned_sql)
+    for stmt in statements:
+        if stmt.strip():
+            return stmt.strip()
+
+    return None
 
 
-# ========== Extract Table from Query ========== #
-def extract_tables_from_query(schema_dict, query):
-    return list({table for table in schema_dict if re.search(
-        rf'\b{table}\b', query, re.IGNORECASE)})
-
-
-# ========== Reset and Regenerate Data ========== # 
-def reset_and_regenerate_data(
-        conn: mysql.connector.connection.MySQLConnection, 
-        # table: str, 
-        # schema: list[tuple[str, str]], 
-        schema_dict: dict,
-        query: str,
-        num_rows: int=5):
+# ========== Generate Symbolic Tables ========== #
+def generate_symbolic_tables(
+    table_schemas: Dict[str, List[str]],
+    num_rows: int = 2
+) -> Dict[str, List[List[ExprRef]]]:
     """
-        Resets the specified table by clearing its contents and regenerating sample data.
+    Generate symbolic tables for each table and column using Z3 variables.
 
-        Args:
-            conn (mysql.connector.connection.MySQLConnection): The MySQL database connection object.
-            table (str): The name of the table to reset and regenerate data for.
-            schema (list[tuple[str, str]]): The schema of the table, represented as a list of (column_name, column_type) tuples.
-            num_rows (int, optional): The number of rows of sample data to generate. Defaults to 5.
+    Args:
+        table_schemas (Dict[str, List[str]]): Mapping of table name to list of column names.
+        num_rows (int): Number of symbolic rows per table.
 
-        Returns:
-            None
-        """
+    Returns:
+        Dict[str, List[List[z3.ExprRef]]]: Symbolic table data.
+    """
+    symbolic_tables = {}
+
+    for table_name, columns in table_schemas.items():
+        table_data = []
+        for row_index in range(num_rows):
+            row = []
+            for col in columns:
+                var_name = f"{table_name}_{col}_{row_index}"
+                sym_var = Int(var_name)  # assuming INT types for now
+                row.append(sym_var)
+            table_data.append(row)
+        symbolic_tables[table_name] = table_data
+
+    return symbolic_tables
+
+
+# ========== Extract Table Schemas ========== #
+def extract_table_schemas(
+    conn: mysql.connector.connection.MySQLConnection,
+    database: str = "tpcsds",
+    only_tables: List[str] = None
+) -> Dict[str, List[str]]:
+    """
+    Extract column names for each table in the specified MySQL database.
+
+    Args:
+        conn (MySQLConnection): A live connection to MySQL
+        database (str): Name of the target database
+        only_tables (List[str], optional): List of table names to include
+
+    Returns:
+        Dict[str, List[str]]: {table_name: [col1, col2, ...]}
+    """
     cursor = conn.cursor()
-    tables = extract_tables_from_query(schema_dict, query)
+    table_schemas = {}
+
+    if only_tables:
+        tables = only_tables
+    else:
+        cursor.execute(f"""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+            ORDER BY table_name
+        """, (database,))
+        tables = [row[0] for row in cursor.fetchall()]
 
     for table in tables:
-        schema = schema_dict.get(table, []) 
-        clear_table(cursor, table)
-        generate_data(cursor, table, schema, num_rows=num_rows)
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """, (database, table))
+        columns = [row[0] for row in cursor.fetchall()]
+        table_schemas[table] = columns
 
-    # Commit the changes to the database
-    conn.commit()
+    cursor.close()
+    return table_schemas
 
 
-# ========== Get Query Results ========== # 
-def get_query_results(cursor, query):
-    return execute_query(cursor, query)
-
-
-# ========== Query Equivalence ========== #
-def queries_equivalent(
-        conn: mysql.connector.connection.MySQLConnection, 
-        q1: str, 
-        q2: str) -> bool:
+# ========== Extract Table Names ========== #
+def extract_table_names(sql: str) -> List[str]:
     """
-    Determines whether two SQL queries produce equivalent results.
-    """
-    # Add MySQL 8.0 compatibility settings
-    cursor = conn.cursor()
-    cursor.execute("SET SESSION sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));")
-    cursor.execute("SET SESSION sql_mode=(SELECT REPLACE(@@sql_mode,'ANSI',''));")
-    
-    try:
-        # Use separate cursors for each query
-        cursor1 = conn.cursor(buffered=True)
-        r1 = get_query_results(cursor1, q1)
-        conn.commit()
-        
-        cursor2 = conn.cursor(buffered=True)
-        r2 = get_query_results(cursor2, q2)
-        conn.commit()
-        
-        return r1 == r2
-    except mysql.connector.Error as err:
-        print(f"Database error: {err}")
-        return False
-    finally:
-        try:
-            cursor1.close()
-            cursor2.close()
-        except:
-            pass
-
-
-# ========== Find CounterExample ========== #
-def find_counterexample(
-        conn: mysql.connector.connection.MySQLConnection, 
-        schema_dict: dict,
-        q1: str, 
-        q2: str, 
-        max_attempts: int=5):
-    """
-    Attempts to find a counterexample that demonstrates the non-equivalence 
-    of two SQL queries by repeatedly resetting and regenerating data and 
-    testing their equivalence.
+    Extract all physical table names (not aliases or CTEs) from a SQL query.
+    Uses sqlglot for full AST parsing.
 
     Args:
-        conn (mysql.connector.connection.MySQLConnection): 
-            A MySQL database connection object.
-        q1 (str): The first SQL query to compare.
-        q2 (str): The second SQL query to compare.
-        max_attempts (int, optional): 
-            The maximum number of attempts to find a counterexample. 
-            Defaults to 5.
+        sql (str): SQL query string
 
     Returns:
-        bool: 
-            False if a counterexample is found (queries are not equivalent), 
-            True if no counterexample is found after the specified attempts 
-            (queries are equivalent).
+        List[str]: Unique table names used in the query
     """
-    try:
-        for _ in range(max_attempts):
-            # Reset and regenerate data
-            reset_and_regenerate_data(conn, schema_dict, q1 + " " + q2)
-            conn.commit()  # Ensure changes are committed
-            
-            # Create fresh connection for query comparison
-            new_conn = get_connection()
-            try:
-                if not queries_equivalent(new_conn, q1, q2):
-                    return False
-            finally:
-                new_conn.close()
-        return True
-    except mysql.connector.Error as err:
-        print(f"Database error in find_counterexample: {err}")
-        return False
+    expression = sqlglot.parse_one(sql)
+    table_names = {
+        t.name for t in expression.find_all(Table)
+    }
+    return sorted(table_names)
+
+
+# ========== Compile Value ========== #
+def compile_value(val_expr, env: Dict[str, ExprRef]) -> ExprRef:
+    if isinstance(val_expr, exp.Column):
+        col = val_expr.sql().lower()
+        return env.get(col, Int(f"missing_{col}"))
+
+    if isinstance(val_expr, exp.Literal):
+        if val_expr.is_string:
+            return StringVal(val_expr.name)
+        try:
+            return IntVal(int(val_expr.name))
+        except ValueError:
+            return RealVal(val_expr.name)
+
+    if isinstance(val_expr, exp.Paren):
+        return compile_value(val_expr.this, env)
+
+    if isinstance(val_expr, exp.Mul):
+        return compile_value(val_expr.left, env) * compile_value(val_expr.right, env)
+    if isinstance(val_expr, exp.Div):
+        return compile_value(val_expr.left, env) / compile_value(val_expr.right, env)
+    if isinstance(val_expr, exp.Add):
+        return compile_value(val_expr.left, env) + compile_value(val_expr.right, env)
+    if isinstance(val_expr, exp.Sub):
+        return compile_value(val_expr.left, env) - compile_value(val_expr.right, env)
+
+    return IntVal(0)  # fallback
+
+
+# ========== Compile Binary Expression ========== #
+def compile_binary(expr, env: Dict[str, ExprRef], operator: str) -> ExprRef:
+    """
+    Compile a binary expression (e.g. x = y, x > 5) into a Z3 expression.
+    """
+    left = compile_value(expr.left, env)
+    right = compile_value(expr.right, env)
+
+    if operator == '==':
+        return left == right
+    elif operator == '!=':
+        return left != right
+    elif operator == '>':
+        return left > right
+    elif operator == '>=':
+        return left >= right
+    elif operator == '<':
+        return left < right
+    elif operator == '<=':
+        return left <= right
+
+    return BoolVal(True)
+
+
+# ========== Compile Condition ========== #
+def compile_condition(expr, env: Dict[str, ExprRef]) -> ExprRef:
+    """
+    Recursively compiles a SQL expression into a Z3 logical expression.
+
+    Args:
+        expr: sqlglot Expression (WHERE clause or part of it)
+        env: mapping from qualified column names to Z3 symbolic variables
+
+    Returns:
+        Z3 expression (ExprRef)
+    """
+    if expr is None:
+        return BoolVal(True)
+
+    if isinstance(expr, exp.Paren):
+        return compile_condition(expr.this, env)
+
+    if isinstance(expr, exp.And):
+        return And(
+            compile_condition(expr.left, env),
+            compile_condition(expr.right, env)
+        )
+
+    if isinstance(expr, exp.Or):
+        return Or(
+            compile_condition(expr.left, env),
+            compile_condition(expr.right, env)
+        )
+
+    if isinstance(expr, exp.Not):
+        return Not(compile_condition(expr.this, env))
+
+    # Comparison Operators
+    if isinstance(expr, exp.EQ):
+        return compile_binary(expr, env, operator='==')
+    if isinstance(expr, exp.NEQ):
+        return compile_binary(expr, env, operator='!=')
+    if isinstance(expr, exp.GT):
+        return compile_binary(expr, env, operator='>')
+    if isinstance(expr, exp.GTE):
+        return compile_binary(expr, env, operator='>=')
+    if isinstance(expr, exp.LT):
+        return compile_binary(expr, env, operator='<')
+    if isinstance(expr, exp.LTE):
+        return compile_binary(expr, env, operator='<=')
+
+    return BoolVal(True)  # fallback for unsupported nodes
+
+
+# ========== Symbolic Query Compiler ========== #
+def compile_symbolic_query(
+    sql: str,
+    symbolic_tables: Dict[str, List[List[ExprRef]]],
+    table_schemas: Dict[str, List[str]],
+    num_rows: int = 2
+) -> List[Tuple]:
+    ast = parse_one(sql)
+    result = []
+
+    if not isinstance(ast, exp.Select):
+        ast = ast.find(exp.Select)
+
+    # Get real tables used
+    from_tables = [t.name for t in ast.find_all(exp.Table)]
+    select_exprs = ast.expressions
+    where_clause = ast.args.get("where")
+    group_by_exprs = ast.args.get("group")
+
+    # Build table rows as Cartesian product
+    table_rows = [symbolic_tables[t] for t in from_tables]
+    for row_indices in product(range(num_rows), repeat=len(from_tables)):
+        env = {}
+        for t_idx, t_name in enumerate(from_tables):
+            schema = table_schemas[t_name]
+            row = table_rows[t_idx][row_indices[t_idx]]
+            for col_idx, col in enumerate(schema):
+                env[f"{t_name}.{col}"] = row[col_idx]
+
+        # Evaluate WHERE condition
+        if where_clause:
+            condition = compile_condition(where_clause, env)
+            s = Solver()
+            s.add(condition)
+            if s.check() != sat:
+                continue  # skip this row
+
+        # Evaluate SELECT projection
+        projected = []
+        for sel in select_exprs:
+            expr_val = compile_value(sel.this, env)
+            projected.append(expr_val)
+
+        result.append(projected)
+
+    # Grouping and Aggregation
+    if group_by_exprs:
+        grouped = {}
+        for row in result:
+            group_key = tuple(compile_value(e, env) for e in group_by_exprs.expressions)
+            grouped.setdefault(group_key, []).append(row)
+
+        agg_result = []
+        for key, group_rows in grouped.items():
+            # Replace AVG(x) or SUM(x) with symbolic aggregate
+            row_exprs = []
+            for sel in select_exprs:
+                if isinstance(sel.this, exp.Alias):
+                    inner = sel.this.this
+                else:
+                    inner = sel.this
+
+                if isinstance(inner, exp.Avg):
+                    values = [compile_value(inner.this, env) for env in group_rows]
+                    avg_expr = Sum(values) / len(values)
+                    row_exprs.append(avg_expr)
+                elif isinstance(inner, exp.Sum):
+                    values = [compile_value(inner.this, env) for env in group_rows]
+                    sum_expr = Sum(values)
+                    row_exprs.append(sum_expr)
+                else:
+                    row_exprs.append(compile_value(inner, env))  # pass-through
+
+            agg_result.append(row_exprs)
+        return agg_result
+
+    return result
+
+
+# ========== Semantic Equivalence Check ========== #
+def check_semantic_equivalence(
+    q1_exprs: List[List[ExprRef]],
+    q2_exprs: List[List[ExprRef]]
+) -> Tuple[bool, Optional[ModelRef]]:
+    """
+    Checks whether the outputs of two queries are semantically equivalent
+    by comparing their symbolic outputs using Z3.
+
+    Args:
+        q1_exprs: Symbolic result rows from Query 1
+        q2_exprs: Symbolic result rows from Query 2
+
+    Returns:
+        (bool, model) – True if equivalent, False if a counterexample exists
+    """
+    s = Solver()
+
+    # Assume unordered set semantics (ignoring order and duplicates)
+    # Create disjunction: EXISTS row IN Q1 but NOT IN Q2, OR vice versa
+    def set_diff_expr(A, B):
+        exprs = []
+        for a in A:
+            not_in_B = And([Not(And([a[i] == b[i] for i in range(len(a))])) for b in B])
+            exprs.append(not_in_B)
+        return Or(exprs) if exprs else BoolVal(False)
+
+    q1_diff = set_diff_expr(q1_exprs, q2_exprs)
+    q2_diff = set_diff_expr(q2_exprs, q1_exprs)
+    inequivalence = Or(q1_diff, q2_diff)
+
+    s.add(inequivalence)
+
+    if s.check() == sat:
+        return False, s.model()
+    else:
+        return True, None
+    
+
+# ========== Test Semantic Equivalence ========== #
+def test_semantic_equivalence(query_file_1, query_file_2):
+    # Step 1: Load queries
+    sql1 = read_clean_sql(query_file_1)
+    sql2 = read_clean_sql(query_file_2)
+
+    if not sql1 or not sql2:
+        print("❌ Failed to load one of the SQL files.")
+        return
+
+    # Step 2: Extract table names
+    tables_1 = extract_table_names(sql1)
+    tables_2 = extract_table_names(sql2)
+    tables = sorted(set(tables_1 + tables_2))
+
+    print(f"📦 Tables used: {tables}")
+
+    # Step 3: Connect to MySQL and get schemas
+    conn = get_connection()
+    schemas = extract_table_schemas(conn, only_tables=tables)
+
+    # Step 4: Generate symbolic tables
+    sym_tables = generate_symbolic_tables(schemas, num_rows=2)
+
+    # Step 5: Compile both queries
+    q1_exprs = compile_symbolic_query(sql1, sym_tables, schemas, num_rows=2)
+    q2_exprs = compile_symbolic_query(sql2, sym_tables, schemas, num_rows=2)
+
+    # Step 6: Check equivalence
+    print("🔍 Checking semantic equivalence...")
+    equiv, model = check_semantic_equivalence(q1_exprs, q2_exprs)
+
+    if equiv:
+        print("✅ Queries are semantically equivalent.")
+    else:
+        print("❌ Queries are NOT equivalent.")
+        print("Counterexample model:")
+        print(model)
 
 
 # ========== Main Function ========== #
 if __name__ == '__main__':
-    conn = None
-    try:
-        # Load the schema
-        with open("../benchmark/tpcds_schema.json") as f:
-            TPCDS_SCHEMA = json.load(f)
+    # ========== Example Usage ========== #
+    # conn = get_connection()
+    # print("TPC-DS database is ready and loaded.")
 
-        # Create fresh connection
-        conn = get_connection()
-        
-        # Create tables and ensure they're committed
-        create_tables(conn, TPCDS_SCHEMA)
-        conn.commit()
+    # query_file = "../benchmark/queries/query1.sql"
+    # cleaned_query = read_clean_sql(query_file)
+    # if cleaned_query:
+    #     print("Cleaned SQL:")
+    #     print(cleaned_query)
+    #     tables = extract_table_names(cleaned_query)
+    #     print("Detected tables:", tables)
+    # else:
+    #     print("No valid SQL found.")
 
-        # Load queries
-        with open("../benchmark/queries/query2.sql") as f:
-            q1 = f.read()
-        q2 = q1.replace("sales_price", "sales_price * 1.0")
+    
 
-        # Ensure tables exist before testing
-        cursor = conn.cursor()
-        cursor.execute("SHOW TABLES;")
-        tables = cursor.fetchall()
-        print(f"Available tables: {[t[0] for t in tables]}")
-        cursor.close()
+    # Minimal schema for testing
+    # schemas = {
+    #     'store_returns': ['sr_customer_sk', 'sr_store_sk', 'sr_returned_date_sk', 'sr_return_amt_inc_tax'],
+    #     'date_dim': ['d_date_sk', 'd_year'],
+    #     'customer': ['c_customer_sk', 'c_customer_id'],
+    #     'store': ['s_store_sk', 's_state']
+    # }
 
-        # Test equivalence
-        equivalent = find_counterexample(conn, TPCDS_SCHEMA, q1, q2)
-        print("Queries appear equivalent." if equivalent else "Counterexample found. Queries are not equivalent.")
+    # sym_tables = generate_symbolic_tables(schemas, num_rows=2)
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+    # for table, rows in sym_tables.items():
+    #     print(f"\nTable: {table}")
+    #     for row in rows:
+    #         print("  " + ", ".join(str(col) for col in row))
+
+    # # Extract full schema or only selected tables
+    # schemas = extract_table_schemas(
+    #     conn, 
+    #     only_tables=['store_returns', 'date_dim', 'customer', 'store']
+    # )
+    # for table, cols in schemas.items():
+    #     print(f"{table}: {cols}")
+
+    test_semantic_equivalence(
+        query_file_1="../benchmark/queries/query1.sql", 
+        query_file_2="../benchmark/mod_queries/query1.sql")
