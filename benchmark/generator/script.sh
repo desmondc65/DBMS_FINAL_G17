@@ -7,7 +7,8 @@ TOOLS_DIR=$ROOT_DIR/tpcds-kit/tools
 DATA_DIR=$ROOT_DIR/data
 QUERIES_DIR=$ROOT_DIR/queries
 OUTPUT_DIR=$ROOT_DIR/output
-
+TIME=$(which time)
+TIME_LIMIT="10s"
 
 # Function to debug and record the timestamp of each step of the script
 log() {
@@ -84,14 +85,14 @@ generate_queries() {
 
 run_queries() {
 	log "------------ Running queries! -----------------------"
-	mkdir -p $OUTPUT_DIR && mkdir -p $OUTPUT_DIR/res && mkdir -p $OUTPUT_DIR/err # create the output folders
+	mkdir -p $OUTPUT_DIR && mkdir -p $OUTPUT_DIR/res && mkdir -p $OUTPUT_DIR/stat # create the output folders
 	
 	while read query_file; do # for every query considering the query order
 		((i++))
 		log "----------------- ${i} - "`basename $query_file .sql`
 		
 		RESULT_FILE="$OUTPUT_DIR/res/`basename $query_file .sql`.res"
-		ERROR_FILE="$OUTPUT_DIR/err/`basename $query_file .sql`.err"
+		STATISTICS_FILE="$OUTPUT_DIR/stat/`basename $query_file .sql`.stat"
 		MYSQL_LOG_FILE="/var/log/mysql/`basename $query_file .sql`.log"
 		
 		# create/truncate and set the variable for log file
@@ -101,11 +102,14 @@ run_queries() {
 		sudo mysql -uroot -e "SET GLOBAL slow_query_log_file = '${MYSQL_LOG_FILE}';"
 		
 		# execute the query
-		sudo mysql -uroot $DATABASE < $query_file > $RESULT_FILE 2> $ERROR_FILE
-		
+		$TIME -v timeout $TIME_LIMIT sudo mysql -uroot $DATABASE < $query_file > $RESULT_FILE 2> $STATISTICS_FILE
+		if [ $? -eq 124 ]; then
+  			echo "Timeout" >> $STATISTICS_FILE
+			log "---------------------- TIMEOUT"
+		fi		
+
 		# remove output files if they are empty
-		[ -s "$ERROR_FILE" ] && log "---------------------- ERROR"
-		[ -s "$ERROR_FILE" ] || rm -f "$ERROR_FILE"
+		[ -s "$STATISTICS_FILE" ] || rm -f "$STATISTICS_FILE"
 		[ -s "$MYSQL_LOG_FILE" ] || rm -f "$MYSQL_LOG_FILE"
 		[ -s "$RESULT_FILE" ] || rm -f "$RESULT_FILE"
 
