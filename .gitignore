@@ -1,1 +1,6 @@
 SqlRewriter/config.json 
+SqlRewriter/config.json 
+SqlRewriter/sql_errors.log 
+benchmark/mod_queries/
+__pycache__
+SqlRewriter/tpcds_data_dump.sql
