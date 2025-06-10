@@ -1,0 +1,1 @@
+-- No SQL query provided for optimization.
