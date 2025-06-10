@@ -115,7 +115,7 @@ def time_queries(queries_dir: str):
 # conn.close()
 
 if __name__ == "__main__":
-    # time_queries("benchmark/original_queries")
-    # time_queries("benchmark/in_context_learning_queries")
+    time_queries("benchmark/original_queries")
+    time_queries("benchmark/in_context_learning_queries")
     time_queries("benchmark/static_rule_queries")
     time_queries("benchmark/teacher_student_queries")
